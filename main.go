@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,11 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 func main() {
 	// Get configuration from environment
@@ -55,18 +58,6 @@ func main() {
 	log.Printf("Arcpoint MCP Client v%s", version)
 	log.Printf("Connecting to: %s", apiURL)
 
-	// Create HTTP client with reasonable timeouts
-	client := &http.Client{
-		Timeout: 5 * time.Minute, // Long timeout for streaming responses
-		Transport: &http.Transport{
-			MaxIdleConns:        10,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false,
-			DisableKeepAlives:   false,
-			MaxIdleConnsPerHost: 5,
-		},
-	}
-
 	// Set up context with cancellation for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -80,23 +71,164 @@ func main() {
 		cancel()
 	}()
 
-	// Start the stdio-to-HTTP proxy
-	if err := proxyStdioToHTTP(ctx, client, apiURL, apiToken); err != nil {
-		log.Fatalf("Proxy error: %v", err)
+	// Start the SSE client
+	client := NewSSEClient(apiURL, apiToken)
+	if err := client.Run(ctx); err != nil {
+		log.Fatalf("Client error: %v", err)
 	}
 }
 
-// proxyStdioToHTTP reads JSON-RPC messages from stdin and forwards them to the MCP HTTP server
-func proxyStdioToHTTP(ctx context.Context, client *http.Client, baseURL, token string) error {
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // Support large messages (up to 10MB)
+// SSEClient handles the SSE connection and stdio proxying
+type SSEClient struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+	sessionID  string
+	mu         sync.RWMutex
+}
 
-	messageEndpoint := baseURL + "/message"
+// NewSSEClient creates a new SSE client
+func NewSSEClient(baseURL, token string) *SSEClient {
+	return &SSEClient{
+		baseURL: baseURL,
+		token:   token,
+		httpClient: &http.Client{
+			Timeout: 0, // No timeout for SSE connection
+			Transport: &http.Transport{
+				MaxIdleConns:        10,
+				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  true, // SSE doesn't work well with compression
+				DisableKeepAlives:   false,
+				MaxIdleConnsPerHost: 5,
+			},
+		},
+	}
+}
+
+// Run starts the SSE connection and stdio proxy
+func (c *SSEClient) Run(ctx context.Context) error {
+	// Start SSE connection in background
+	sseCtx, sseCancel := context.WithCancel(ctx)
+	defer sseCancel()
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- c.connectSSE(sseCtx)
+	}()
+
+	// Wait for connection to establish and get session ID
+	time.Sleep(500 * time.Millisecond)
+
+	// Start reading from stdin and sending messages
+	go c.readStdin(ctx)
+
+	// Wait for error or context cancellation
+	select {
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// connectSSE establishes and maintains the SSE connection
+func (c *SSEClient) connectSSE(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+"/sse", nil)
+	if err != nil {
+		return fmt.Errorf("failed to create SSE request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("User-Agent", fmt.Sprintf("arcpoint-mcp-client/%s", version))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("SSE connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("SSE connection failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Println("SSE connection established")
+
+	// Parse SSE events
+	scanner := bufio.NewScanner(resp.Body)
+	var eventType string
+	var eventData []string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if line == "" {
+			// Empty line marks end of event
+			if eventType == "endpoint" && len(eventData) > 0 {
+				// Extract session ID from endpoint URL
+				endpointData := strings.Join(eventData, "\n")
+				c.extractSessionID(endpointData)
+				log.Printf("Session established: %s", c.getSessionID())
+			} else if eventType == "message" && len(eventData) > 0 {
+				// Forward message to stdout
+				messageData := strings.Join(eventData, "\n")
+				fmt.Println(messageData)
+			}
+			eventType = ""
+			eventData = nil
+			continue
+		}
+
+		if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		} else if strings.HasPrefix(line, "data:") {
+			data := strings.TrimPrefix(line, "data:")
+			eventData = append(eventData, data)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading SSE stream: %w", err)
+	}
+
+	return nil
+}
+
+// extractSessionID parses the endpoint URL to extract the session ID
+func (c *SSEClient) extractSessionID(endpoint string) {
+	// Endpoint format: "/message?sessionId=xxx"
+	parts := strings.Split(endpoint, "sessionId=")
+	if len(parts) == 2 {
+		sessionID := strings.TrimSpace(parts[1])
+		c.setSessionID(sessionID)
+	}
+}
+
+// setSessionID safely sets the session ID
+func (c *SSEClient) setSessionID(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessionID = id
+}
+
+// getSessionID safely gets the session ID
+func (c *SSEClient) getSessionID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessionID
+}
+
+// readStdin reads JSON-RPC messages from stdin and sends them to the server
+func (c *SSEClient) readStdin(ctx context.Context) {
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // Support large messages
 
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		default:
 		}
 
@@ -105,76 +237,112 @@ func proxyStdioToHTTP(ctx context.Context, client *http.Client, baseURL, token s
 			continue
 		}
 
-		// Forward the JSON-RPC message to the MCP server
-		req, err := http.NewRequestWithContext(ctx, "POST", messageEndpoint, strings.NewReader(string(line)))
+		// Wait for session ID if not available yet
+		sessionID := c.getSessionID()
+		if sessionID == "" {
+			// Try a few times with backoff
+			for i := 0; i < 10 && sessionID == ""; i++ {
+				time.Sleep(100 * time.Millisecond)
+				sessionID = c.getSessionID()
+			}
+			if sessionID == "" {
+				log.Println("Warning: Session not established yet, attempting to send anyway")
+			}
+		}
+
+		// Send message via POST
+		messageURL := c.baseURL + "/message"
+		if sessionID != "" {
+			messageURL += "?sessionId=" + sessionID
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", messageURL, bytes.NewReader(line))
 		if err != nil {
 			log.Printf("Failed to create request: %v", err)
 			continue
 		}
 
-		// Add authentication and headers
-		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", fmt.Sprintf("arcpoint-mcp-client/%s", version))
 
-		// Send request
-		resp, err := client.Do(req)
+		// Create a new client with timeout for message sending
+		msgClient := &http.Client{Timeout: 30 * time.Second}
+		resp, err := msgClient.Do(req)
 		if err != nil {
 			log.Printf("Request failed: %v", err)
-			// Write error response to stdout
-			fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","error":{"code":-32603,"message":"Connection error: %s"}}`+"\n", err.Error())
+			c.writeError(-32603, fmt.Sprintf("Connection error: %s", err.Error()))
 			continue
 		}
 
-		// Read response body
+		// For SSE transport, we expect 202 Accepted (response comes via SSE)
+		// or 200 OK with immediate response
+		if resp.StatusCode == http.StatusAccepted {
+			resp.Body.Close()
+			// Response will come via SSE
+			continue
+		}
+
+		// Read immediate response
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		if err != nil {
 			log.Printf("Failed to read response: %v", err)
-			fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","error":{"code":-32603,"message":"Failed to read response"}}`+"\n")
+			c.writeError(-32603, "Failed to read response")
 			continue
 		}
 
-		// Check for HTTP errors
 		if resp.StatusCode != http.StatusOK {
 			log.Printf("HTTP error %d: %s", resp.StatusCode, string(body))
-
-			// Map HTTP errors to JSON-RPC errors
-			var errorCode int
-			var errorMessage string
-
-			switch resp.StatusCode {
-			case http.StatusUnauthorized:
-				errorCode = -32001
-				errorMessage = "Invalid API token"
-			case http.StatusForbidden:
-				errorCode = -32002
-				errorMessage = "Access denied"
-			case http.StatusTooManyRequests:
-				errorCode = -32003
-				errorMessage = "Rate limit exceeded"
-			case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-				errorCode = -32004
-				errorMessage = "Service temporarily unavailable"
-			default:
-				errorCode = -32603
-				errorMessage = fmt.Sprintf("Server error: %d", resp.StatusCode)
-			}
-
-			fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","error":{"code":%d,"message":"%s"}}`+"\n", errorCode, errorMessage)
+			c.writeHTTPError(resp.StatusCode)
 			continue
 		}
 
-		// Forward successful response to stdout
-		os.Stdout.Write(body)
-		os.Stdout.Write([]byte("\n"))
+		// Forward immediate response to stdout
+		fmt.Println(string(body))
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading stdin: %w", err)
+		log.Printf("Error reading stdin: %v", err)
+	}
+}
+
+// writeError writes a JSON-RPC error to stdout
+func (c *SSEClient) writeError(code int, message string) {
+	err := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"error": map[string]interface{}{
+			"code":    code,
+			"message": message,
+		},
+	}
+	data, _ := json.Marshal(err)
+	fmt.Println(string(data))
+}
+
+// writeHTTPError maps HTTP errors to JSON-RPC errors
+func (c *SSEClient) writeHTTPError(statusCode int) {
+	var errorCode int
+	var errorMessage string
+
+	switch statusCode {
+	case http.StatusUnauthorized:
+		errorCode = -32001
+		errorMessage = "Invalid API token"
+	case http.StatusForbidden:
+		errorCode = -32002
+		errorMessage = "Access denied"
+	case http.StatusTooManyRequests:
+		errorCode = -32003
+		errorMessage = "Rate limit exceeded"
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		errorCode = -32004
+		errorMessage = "Service temporarily unavailable"
+	default:
+		errorCode = -32603
+		errorMessage = fmt.Sprintf("Server error: %d", statusCode)
 	}
 
-	return nil
+	c.writeError(errorCode, errorMessage)
 }
