@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const version = "1.0.1"
+const version = "1.0.2"
 
 func main() {
 	// Get configuration from environment
@@ -107,27 +107,34 @@ func NewSSEClient(baseURL, token string) *SSEClient {
 
 // Run starts the SSE connection and stdio proxy
 func (c *SSEClient) Run(ctx context.Context) error {
-	// Start SSE connection in background
-	sseCtx, sseCancel := context.WithCancel(ctx)
-	defer sseCancel()
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.connectSSE(sseCtx)
-	}()
-
-	// Wait for connection to establish and get session ID
-	time.Sleep(500 * time.Millisecond)
-
 	// Start reading from stdin and sending messages
 	go c.readStdin(ctx)
 
-	// Wait for error or context cancellation
-	select {
-	case err := <-errChan:
-		return err
-	case <-ctx.Done():
-		return nil
+	// Keep reconnecting SSE connection if it drops
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		log.Println("Connecting to SSE stream...")
+		err := c.connectSSE(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				// Context cancelled, exit cleanly
+				return nil
+			}
+			log.Printf("SSE connection error: %v, reconnecting in 2s...", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Connection closed cleanly, try to reconnect
+		if ctx.Err() == nil {
+			log.Println("SSE connection closed, reconnecting in 2s...")
+			time.Sleep(2 * time.Second)
+		}
 	}
 }
 
@@ -154,7 +161,7 @@ func (c *SSEClient) connectSSE(ctx context.Context) error {
 		return fmt.Errorf("SSE connection failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
-	log.Println("SSE connection established")
+	log.Println("SSE stream connected")
 
 	// Parse SSE events
 	scanner := bufio.NewScanner(resp.Body)
